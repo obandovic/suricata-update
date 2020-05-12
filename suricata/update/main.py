@@ -22,16 +22,15 @@ import re
 import os.path
 import logging
 import argparse
-import shlex
 import time
 import hashlib
 import fnmatch
 import subprocess
-import types
 import shutil
 import glob
 import io
 import tempfile
+import signal
 
 try:
     # Python 3.
@@ -46,22 +45,22 @@ except:
     print("error: pyyaml is required")
     sys.exit(1)
 
-if sys.argv[0] == __file__:
-    sys.path.insert(
-        0, os.path.abspath(os.path.join(__file__, "..", "..", "..")))
-
-import suricata.update.rule
-import suricata.update.engine
-import suricata.update.net
-import suricata.update.loghandler
-from suricata.update import config
-from suricata.update import configs
-from suricata.update import extract
-from suricata.update import util
-from suricata.update import sources
-from suricata.update import commands
-from suricata.update import exceptions
-from suricata.update import notes
+from suricata.update import (
+    commands,
+    config,
+    configs,
+    engine,
+    exceptions,
+    extract,
+    loghandler,
+    net,
+    notes,
+    parsers,
+    rule as rule_mod,
+    sources,
+    util,
+    matchers as matchers_mod
+)
 
 from suricata.update.version import version
 try:
@@ -69,11 +68,15 @@ try:
 except:
     revision = None
 
+if sys.argv[0] == __file__:
+    sys.path.insert(
+        0, os.path.abspath(os.path.join(__file__, "..", "..", "..")))
+
 # Initialize logging, use colour if on a tty.
-if len(logging.root.handlers) == 0 and os.isatty(sys.stderr.fileno()):
+if len(logging.root.handlers) == 0:
     logger = logging.getLogger()
+    loghandler.configure_logging()
     logger.setLevel(level=logging.INFO)
-    logger.addHandler(suricata.update.loghandler.SuriColourLogHandler())
 else:
     logging.basicConfig(
         level=logging.INFO,
@@ -87,214 +90,7 @@ DEFAULT_SURICATA_VERSION = "4.0.0"
 # single file concatenating all input rule files together.
 DEFAULT_OUTPUT_RULE_FILENAME = "suricata.rules"
 
-class AllRuleMatcher(object):
-    """Matcher object to match all rules. """
-
-    def match(self, rule):
-        return True
-
-    @classmethod
-    def parse(cls, buf):
-        if buf.strip() == "*":
-            return cls()
-        return None
-
-class ProtoRuleMatcher:
-    """A rule matcher that matches on the protocol of a rule."""
-
-    def __init__(self, proto):
-        self.proto = proto
-
-    def match(self, rule):
-        return rule.proto == self.proto
-
-class IdRuleMatcher(object):
-    """Matcher object to match an idstools rule object by its signature
-    ID."""
-
-    def __init__(self, generatorId=None, signatureId=None):
-        self.signatureIds = []
-        if generatorId and signatureId:
-            self.signatureIds.append((generatorId, signatureId))
-
-    def match(self, rule):
-        for (generatorId, signatureId) in self.signatureIds:
-            if generatorId == rule.gid and signatureId == rule.sid:
-                return True
-        return False
-
-    @classmethod
-    def parse(cls, buf):
-        matcher = cls()
-
-        for entry in buf.split(","):
-            entry = entry.strip()
-
-            parts = entry.split(":", 1)
-            if not parts:
-                return None
-            if len(parts) == 1:
-                try:
-                    signatureId = int(parts[0])
-                    matcher.signatureIds.append((1, signatureId))
-                except:
-                    return None
-            else:
-                try:
-                    generatorId = int(parts[0])
-                    signatureId = int(parts[1])
-                    matcher.signatureIds.append((generatorId, signatureId))
-                except:
-                    return None
-
-        return matcher
-
-class FilenameMatcher(object):
-    """Matcher object to match a rule by its filename. This is similar to
-    a group but has no specifier prefix.
-    """
-
-    def __init__(self, pattern):
-        self.pattern = pattern
-
-    def match(self, rule):
-        if hasattr(rule, "group") and rule.group is not None:
-            return fnmatch.fnmatch(rule.group, self.pattern)
-        return False
-
-    @classmethod
-    def parse(cls, buf):
-        if buf.startswith("filename:"):
-            try:
-                group = buf.split(":", 1)[1]
-                return cls(group.strip())
-            except:
-                pass
-        return None
-
-class GroupMatcher(object):
-    """Matcher object to match an idstools rule object by its group (ie:
-    filename).
-
-    The group is just the basename of the rule file with or without
-    extension.
-
-    Examples:
-    - emerging-shellcode
-    - emerging-trojan.rules
-
-    """
-
-    def __init__(self, pattern):
-        self.pattern = pattern
-
-    def match(self, rule):
-        if hasattr(rule, "group") and rule.group is not None:
-            if fnmatch.fnmatch(os.path.basename(rule.group), self.pattern):
-                return True
-            # Try matching against the rule group without the file
-            # extension.
-            if fnmatch.fnmatch(
-                    os.path.splitext(
-                        os.path.basename(rule.group))[0], self.pattern):
-                return True
-        return False
-
-    @classmethod
-    def parse(cls, buf):
-        if buf.startswith("group:"):
-            try:
-                logger.debug("Parsing group matcher: %s" % (buf))
-                group = buf.split(":", 1)[1]
-                return cls(group.strip())
-            except:
-                pass
-        if buf.endswith(".rules"):
-            return cls(buf.strip())
-        return None
-
-class ReRuleMatcher(object):
-    """Matcher object to match an idstools rule object by regular
-    expression."""
-
-    def __init__(self, pattern):
-        self.pattern = pattern
-
-    def match(self, rule):
-        if self.pattern.search(rule.raw):
-            return True
-        return False
-
-    @classmethod
-    def parse(cls, buf):
-        if buf.startswith("re:"):
-            try:
-                logger.debug("Parsing regex matcher: %s" % (buf))
-                patternstr = buf.split(":", 1)[1].strip()
-                pattern = re.compile(patternstr, re.I)
-                return cls(pattern)
-            except:
-                pass
-        return None
-
-class ModifyRuleFilter(object):
-    """Filter to modify an idstools rule object.
-
-    Important note: This filter does not modify the rule inplace, but
-    instead returns a new rule object with the modification.
-    """
-
-    def __init__(self, matcher, pattern, repl):
-        self.matcher = matcher
-        self.pattern = pattern
-        self.repl = repl
-
-    def match(self, rule):
-        return self.matcher.match(rule)
-
-    def filter(self, rule):
-        modified_rule = self.pattern.sub(self.repl, rule.format())
-        parsed = suricata.update.rule.parse(modified_rule, rule.group)
-        if parsed is None:
-            logger.error("Modification of rule %s results in invalid rule: %s",
-                         rule.idstr, modified_rule)
-            return rule
-        return parsed
-
-    @classmethod
-    def parse(cls, buf):
-        tokens = shlex.split(buf)
-        if len(tokens) == 3:
-            matchstring, a, b = tokens
-        elif len(tokens) > 3 and tokens[0] == "modifysid":
-            matchstring, a, b = tokens[1], tokens[2], tokens[4]
-        else:
-            raise Exception("Bad number of arguments.")
-        matcher = parse_rule_match(matchstring)
-        if not matcher:
-            raise Exception("Bad match string: %s" % (matchstring))
-        pattern = re.compile(a)
-
-        # Convert Oinkmaster backticks to Python.
-        b = re.sub("\$\{(\d+)\}", "\\\\\\1", b)
-
-        return cls(matcher, pattern, b)
-
-class DropRuleFilter(object):
-    """ Filter to modify an idstools rule object to a drop rule. """
-
-    def __init__(self, matcher):
-        self.matcher = matcher
-
-    def match(self, rule):
-        if rule["noalert"]:
-            return False
-        return self.matcher.match(rule)
-
-    def filter(self, rule):
-        drop_rule = suricata.update.rule.parse(re.sub("^\w+", "drop", rule.raw))
-        drop_rule.enabled = rule.enabled
-        return drop_rule
+INDEX_EXPIRATION_TIME = 60 * 60 * 24 * 14
 
 class Fetch:
 
@@ -308,7 +104,7 @@ class Fetch:
                 open(tmp_filename, "rb").read()).hexdigest().strip()
             remote_checksum_buf = io.BytesIO()
             logger.info("Checking %s." % (checksum_url))
-            suricata.update.net.get(checksum_url, remote_checksum_buf)
+            net.get(checksum_url, remote_checksum_buf)
             remote_checksum = remote_checksum_buf.getvalue().decode().strip()
             logger.debug("Local checksum=|%s|; remote checksum=|%s|" % (
                 local_checksum, remote_checksum))
@@ -351,8 +147,18 @@ class Fetch:
 
     def fetch(self, url):
         net_arg = url
-        url = url[0] if isinstance(url, tuple) else url
+        checksum = url[2]
+        url = url[0]
         tmp_filename = self.get_tmp_filename(url)
+        if config.args().offline:
+            if config.args().force:
+                logger.warning("Running offline, skipping download of %s", url)
+            logger.info("Using latest cached version of rule file: %s", url)
+            if not os.path.exists(tmp_filename):
+                logger.error("Can't proceed offline, "
+                             "source %s has not yet been downloaded.", url)
+                sys.exit(1)
+            return self.extract_files(tmp_filename)
         if not config.args().force and os.path.exists(tmp_filename):
             if not config.args().now and \
                time.time() - os.stat(tmp_filename).st_mtime < (60 * 15):
@@ -360,15 +166,17 @@ class Fetch:
                     "Last download less than 15 minutes ago. Not downloading %s.",
                     url)
                 return self.extract_files(tmp_filename)
-            if self.check_checksum(tmp_filename, url):
-                logger.info("Remote checksum has not changed. Not fetching.")
-                return self.extract_files(tmp_filename)
+            if checksum:
+                if self.check_checksum(tmp_filename, url):
+                    logger.info("Remote checksum has not changed. "
+                                "Not fetching.")
+                    return self.extract_files(tmp_filename)
         if not os.path.exists(config.get_cache_dir()):
             os.makedirs(config.get_cache_dir(), mode=0o770)
         logger.info("Fetching %s." % (url))
         try:
             tmp_fileobj = tempfile.NamedTemporaryFile()
-            suricata.update.net.get(
+            net.get(
                 net_arg,
                 tmp_fileobj,
                 progress_hook=self.progress_hook)
@@ -381,6 +189,10 @@ class Fetch:
                     "will use latest cached version: %s", url, err)
                 return self.extract_files(tmp_filename)
             raise err
+        except IOError as err:
+            self.progress_hook_finish()
+            logger.error("Failed to copy file: %s", err)
+            sys.exit(1)
         except Exception as err:
             raise err
         self.progress_hook_finish()
@@ -413,29 +225,6 @@ class Fetch:
         files[basename] = open(filename, "rb").read()
         return files
 
-def parse_rule_match(match):
-    matcher = AllRuleMatcher.parse(match)
-    if matcher:
-        return matcher
-
-    matcher = IdRuleMatcher.parse(match)
-    if matcher:
-        return matcher
-
-    matcher = ReRuleMatcher.parse(match)
-    if matcher:
-        return matcher
-
-    matcher = FilenameMatcher.parse(match)
-    if matcher:
-        return matcher
-
-    matcher = GroupMatcher.parse(match)
-    if matcher:
-        return matcher
-
-    return None
-
 def load_filters(filename):
 
     filters = []
@@ -448,11 +237,12 @@ def load_filters(filename):
             line = line.rsplit(" #")[0]
 
             line = re.sub(r'\\\$', '$', line)  # needed to escape $ in pp
-            filter = ModifyRuleFilter.parse(line)
-            if filter:
-                filters.append(filter)
-            else:
-                log.error("Failed to parse modify filter: %s" % (line))
+            try:
+                rule_filter = matchers_mod.ModifyRuleFilter.parse(line)
+                filters.append(rule_filter)
+            except Exception as err:
+                raise exceptions.ApplicationError(
+                    "Failed to parse modify filter: {}".format(line))
 
     return filters
 
@@ -462,7 +252,7 @@ def load_drop_filters(filename):
     filters = []
 
     for matcher in matchers:
-        filters.append(DropRuleFilter(matcher))
+        filters.append(matchers_mod.DropRuleFilter(matcher))
 
     return filters
 
@@ -474,7 +264,7 @@ def parse_matchers(fileobj):
         if not line or line.startswith("#"):
             continue
         line = line.rsplit(" #")[0]
-        matcher = parse_rule_match(line)
+        matcher = matchers_mod.parse_rule_match(line)
         if not matcher:
             logger.warn("Failed to parse: \"%s\"" % (line))
         else:
@@ -579,7 +369,7 @@ def write_merged(filename, rulemap):
 
         oldset = {}
         if os.path.exists(filename):
-            for rule in suricata.update.rule.parse_file(filename):
+            for rule in rule_mod.parse_file(filename):
                 oldset[rule.id] = True
                 if not rule.id in rulemap:
                     removed.append(rule)
@@ -618,7 +408,7 @@ def write_to_directory(directory, files, rulemap):
                 directory, os.path.basename(filename))
 
             if os.path.exists(outpath):
-                for rule in suricata.update.rule.parse_file(outpath):
+                for rule in rule_mod.parse_file(outpath):
                     oldset[rule.id] = True
                     if not rule.id in rulemap:
                         removed.append(rule)
@@ -647,7 +437,7 @@ def write_to_directory(directory, files, rulemap):
         else:
             content = []
             for line in io.StringIO(files[filename].decode("utf-8")):
-                rule = suricata.update.rule.parse(line)
+                rule = rule_mod.parse(line)
                 if not rule:
                     content.append(line.strip())
                 else:
@@ -672,11 +462,11 @@ def write_sid_msg_map(filename, rulemap, version=1):
         for key in rulemap:
             rule = rulemap[key]
             if version == 2:
-                formatted = suricata.update.rule.format_sidmsgmap_v2(rule)
+                formatted = rule_mod.format_sidmsgmap_v2(rule)
                 if formatted:
                     print(formatted, file=fileobj)
             else:
-                formatted = suricata.update.rule.format_sidmsgmap(rule)
+                formatted = rule_mod.format_sidmsgmap(rule)
                 if formatted:
                     print(formatted, file=fileobj)
 
@@ -692,7 +482,14 @@ def build_rule_map(rules):
         if rule.id not in rulemap:
             rulemap[rule.id] = rule
         else:
+            if rule["rev"] == rulemap[rule.id]["rev"]:
+                logger.warning(
+                    "Found duplicate rule SID {} with same revision, "
+                    "keeping the first rule seen.".format(rule.sid))
             if rule["rev"] > rulemap[rule.id]["rev"]:
+                logger.warning(
+                    "Found duplicate rule SID {}, "
+                    "keeping the rule with greater revision.".format(rule.sid))
                 rulemap[rule.id] = rule
 
     return rulemap
@@ -707,7 +504,7 @@ def dump_sample_configs():
             shutil.copy(os.path.join(configs.directory, filename), filename)
 
 def resolve_flowbits(rulemap, disabled_rules):
-    flowbit_resolver = suricata.update.rule.FlowbitResolver()
+    flowbit_resolver = rule_mod.FlowbitResolver()
     flowbit_enabled = set()
     while True:
         flowbits = flowbit_resolver.get_required_flowbits(rulemap)
@@ -725,6 +522,7 @@ def resolve_flowbits(rulemap, disabled_rules):
                     "Enabling previously disabled rule for flowbits: %s" % (
                         rule.brief()))
             rule.enabled = True
+            rule.noalert = True
             flowbit_enabled.add(rule)
     logger.info("Enabled %d rules for flowbit dependencies." % (
         len(flowbit_enabled)))
@@ -828,32 +626,28 @@ def check_vars(suriconf, rulemap):
     for rule_id in rulemap:
         rule = rulemap[rule_id]
         disable = False
-        for var in suricata.update.rule.parse_var_names(
-                rule["source_addr"]):
+        for var in rule_mod.parse_var_names(rule["source_addr"]):
             if not suriconf.has_key("vars.address-groups.%s" % (var)):
                 logger.warning(
                     "Rule has unknown source address var and will be disabled: %s: %s" % (
                         var, rule.brief()))
                 notes.address_group_vars.add(var)
                 disable = True
-        for var in suricata.update.rule.parse_var_names(
-                rule["dest_addr"]):
+        for var in rule_mod.parse_var_names(rule["dest_addr"]):
             if not suriconf.has_key("vars.address-groups.%s" % (var)):
                 logger.warning(
                     "Rule has unknown dest address var and will be disabled: %s: %s" % (
                         var, rule.brief()))
                 notes.address_group_vars.add(var)
                 disable = True
-        for var in suricata.update.rule.parse_var_names(
-                rule["source_port"]):
+        for var in rule_mod.parse_var_names(rule["source_port"]):
             if not suriconf.has_key("vars.port-groups.%s" % (var)):
                 logger.warning(
                     "Rule has unknown source port var and will be disabled: %s: %s" % (
                         var, rule.brief()))
                 notes.port_group_vars.add(var)
                 disable = True
-        for var in suricata.update.rule.parse_var_names(
-                rule["dest_port"]):
+        for var in rule_mod.parse_var_names(rule["dest_port"]):
             if not suriconf.has_key("vars.port-groups.%s" % (var)):
                 logger.warning(
                     "Rule has unknown dest port var and will be disabled: %s: %s" % (
@@ -891,14 +685,14 @@ def test_suricata(suricata_path):
         logger.info("Testing with suricata -T.")
         suricata_conf = config.get("suricata-conf")
         if not config.get("no-merge"):
-            if not suricata.update.engine.test_configuration(
+            if not engine.test_configuration(
                     suricata_path, suricata_conf,
                     os.path.join(
-                        config.get_output_dir(), DEFAULT_OUTPUT_RULE_FILENAME)):
+                        config.get_output_dir(),
+                        DEFAULT_OUTPUT_RULE_FILENAME)):
                 return False
         else:
-            if not suricata.update.engine.test_configuration(
-                    suricata_path, suricata_conf):
+            if not engine.test_configuration(suricata_path, suricata_conf):
                 return False
 
     return True
@@ -932,10 +726,13 @@ def load_sources(suricata_version):
 
     urls = []
 
+    http_header = None
+    checksum = True
+
     # Add any URLs added with the --url command line parameter.
     if config.args().url:
         for url in config.args().url:
-            urls.append(url)
+            urls.append((url, http_header, checksum))
 
     # Get the new style sources.
     enabled_sources = sources.get_enabled_sources()
@@ -955,6 +752,11 @@ def load_sources(suricata_version):
         if not os.path.exists(index_filename):
             logger.warning("No index exists, will use bundled index.")
             logger.warning("Please run suricata-update update-sources.")
+        if os.path.exists(index_filename) and time.time() - \
+                os.stat(index_filename).st_mtime > INDEX_EXPIRATION_TIME:
+            logger.warning(
+                "Source index is older than 2 weeks. "
+                "Please update with suricata-update update-sources.")
         index = sources.Index(index_filename)
 
         for (name, source) in enabled_sources.items():
@@ -962,32 +764,41 @@ def load_sources(suricata_version):
             params.update(internal_params)
             if "url" in source:
                 # No need to go off to the index.
-                url = (source["url"] % params, source.get("http-header"))
+                http_header = source.get("http_header")
+                checksum = source.get("checksum")
+                url = (source["url"] % params, http_header, checksum)
                 logger.debug("Resolved source %s to URL %s.", name, url[0])
             else:
                 if not index:
                     raise exceptions.ApplicationError(
                         "Source index is required for source %s; "
                         "run suricata-update update-sources" % (source["source"]))
-                url = index.resolve_url(name, params)
+                source_config = index.get_source_by_name(name)
+                try:
+                    checksum = source_config["checksum"]
+                except:
+                    checksum = True
+                url = (index.resolve_url(name, params), http_header,
+                       checksum)
                 logger.debug("Resolved source %s to URL %s.", name, url)
             urls.append(url)
 
     if config.get("sources"):
         for url in config.get("sources"):
-            if type(url) not in [type("")]:
+            if not isinstance(url, str):
                 raise exceptions.InvalidConfigurationError(
                     "Invalid datatype for source URL: %s" % (str(url)))
-            url = url % internal_params
+            url = (url % internal_params, http_header, checksum)
             logger.debug("Adding source %s.", url)
             urls.append(url)
 
     # If --etopen is on the command line, make sure its added. Or if
     # there are no URLs, default to ET/Open.
     if config.get("etopen") or not urls:
-        if not urls:
+        if not config.args().offline and not urls:
             logger.info("No sources configured, will use Emerging Threats Open")
-        urls.append(sources.get_etopen_url(internal_params))
+        urls.append((sources.get_etopen_url(internal_params), http_header,
+                     checksum))
 
     # Converting the URLs to a set removed dupes.
     urls = set(urls)
@@ -1018,167 +829,52 @@ def check_output_directory(output_dir):
                 "Failed to create directory %s: %s" % (
                     output_dir, err))
 
+# Check and disable ja3 rules if needed.
+#
+# Note: This is a bit of a quick fixup job for 5.0, but we should look
+# at making feature handling more generic.
+def disable_ja3(suriconf, rulemap, disabled_rules):
+    if suriconf and suriconf.build_info:
+        enabled = False
+        reason = None
+        logged = False
+        if "HAVE_NSS" not in suriconf.build_info["features"]:
+            reason = "Disabling ja3 rules as Suricata is built without libnss."
+        else:
+            # Check if disabled. Must be explicitly disabled,
+            # otherwise we'll keep ja3 rules enabled.
+            val = suriconf.get("app-layer.protocols.tls.ja3-fingerprints")
+
+            # Prior to Suricata 5, leaving ja3-fingerprints undefined
+            # in the configuration disabled the feature. With 5.0,
+            # having it undefined will enable it as needed.
+            if not val:
+                if suriconf.build_info["version"].major < 5:
+                    val = "no"
+                else:
+                    val = "auto"
+
+            if val and val.lower() not in ["1", "yes", "true", "auto"]:
+                reason = "Disabling ja3 rules as ja3 fingerprints are not enabled."
+            else:
+                enabled = True
+
+        count = 0
+        if not enabled:
+            for key, rule in rulemap.items():
+                if "ja3" in rule["features"]:
+                    if not logged:
+                        logger.warn(reason)
+                        logged = True
+                    rule.enabled = False
+                    disabled_rules.append(rule)
+                    count += 1
+            if count:
+                logger.info("%d ja3_hash rules disabled." % (count))
+
 def _main():
     global args
-
-    default_update_yaml = config.DEFAULT_UPDATE_YAML_PATH
-
-    global_parser = argparse.ArgumentParser(add_help=False)
-    global_parser.add_argument(
-        "-v", "--verbose", action="store_true", default=None,
-        help="Be more verbose")
-    global_parser.add_argument(
-        "-q", "--quiet", action="store_true", default=None,
-        help="Be quiet, warning and error messages only")
-    global_parser.add_argument(
-        "-D", "--data-dir", metavar="<directory>", dest="data_dir",
-        help="Data directory (default: /var/lib/suricata)")
-    global_parser.add_argument(
-        "-c", "--config", metavar="<filename>",
-        help="configuration file (default: %s)" %(default_update_yaml))
-    global_parser.add_argument(
-        "--suricata-conf", metavar="<filename>",
-        help="configuration file (default: /etc/suricata/suricata.yaml)")
-    global_parser.add_argument(
-        "--suricata", metavar="<path>",
-        help="Path to Suricata program")
-    global_parser.add_argument(
-        "--suricata-version", metavar="<version>",
-        help="Override Suricata version")
-    global_parser.add_argument(
-        "--user-agent", metavar="<user-agent>",
-        help="Set custom user-agent string")
-    global_parser.add_argument(
-        "--no-check-certificate", action="store_true", default=None,
-        help="Disable server SSL/TLS certificate verification")
-    global_parser.add_argument(
-        "-V", "--version", action="store_true", default=False,
-        help="Display version")
-
-    global_args, rem = global_parser.parse_known_args()
-
-    if global_args.version:
-        revision_string = " (rev: %s)" % (revision) if revision else ""
-        print("suricata-update version {}{}".format(version, revision_string))
-        return 0
-
-    if not rem or rem[0].startswith("-"):
-        rem.insert(0, "update")
-
-    parser = argparse.ArgumentParser()
-    subparsers = parser.add_subparsers(dest="subcommand", metavar="<command>")
-
-    # The "update" (default) sub-command parser.
-    update_parser = subparsers.add_parser(
-        "update", add_help=True, parents=[global_parser],
-        formatter_class=argparse.RawDescriptionHelpFormatter)
-
-    update_parser.add_argument(
-        "-o", "--output", metavar="<directory>", dest="output",
-        help="Directory to write rules to")
-    update_parser.add_argument("-f", "--force", action="store_true",
-                               default=False,
-                               help="Force operations that might otherwise be skipped")
-    update_parser.add_argument("--yaml-fragment", metavar="<filename>",
-                               help="Output YAML fragment for rule inclusion")
-    update_parser.add_argument("--url", metavar="<url>", action="append",
-                               default=[],
-                               help="URL to use instead of auto-generating one (can be specified multiple times)")
-    update_parser.add_argument("--local", metavar="<path>", action="append",
-                               default=[],
-                               help="Local rule files or directories (can be specified multiple times)")
-    update_parser.add_argument("--sid-msg-map", metavar="<filename>",
-                               help="Generate a sid-msg.map file")
-    update_parser.add_argument("--sid-msg-map-2", metavar="<filename>",
-                               help="Generate a v2 sid-msg.map file")
-    
-    update_parser.add_argument("--disable-conf", metavar="<filename>",
-                               help="Filename of rule disable filters")
-    update_parser.add_argument("--enable-conf", metavar="<filename>",
-                               help="Filename of rule enable filters")
-    update_parser.add_argument("--modify-conf", metavar="<filename>",
-                               help="Filename of rule modification filters")
-    update_parser.add_argument("--drop-conf", metavar="<filename>",
-                               help="Filename of drop rules filters")
-    
-    update_parser.add_argument("--ignore", metavar="<pattern>", action="append",
-                               default=None,
-                               help="Filenames to ignore (can be specified multiple times; default: *deleted.rules)")
-    update_parser.add_argument("--no-ignore", action="store_true",
-                               default=False,
-                               help="Disables the ignore option.")
-    
-    update_parser.add_argument("--threshold-in", metavar="<filename>",
-                               help="Filename of rule thresholding configuration")
-    update_parser.add_argument("--threshold-out", metavar="<filename>",
-                               help="Output of processed threshold configuration")
-    
-    update_parser.add_argument("--dump-sample-configs", action="store_true",
-                               default=False,
-                               help="Dump sample config files to current directory")
-    update_parser.add_argument("--etopen", action="store_true",
-                               help="Use ET-Open rules (default)")
-    update_parser.add_argument("--reload-command", metavar="<command>",
-                               help="Command to run after update if modified")
-    update_parser.add_argument("--no-reload", action="store_true", default=False,
-                               help="Disable reload")
-    update_parser.add_argument("-T", "--test-command", metavar="<command>",
-                               help="Command to test Suricata configuration")
-    update_parser.add_argument("--no-test", action="store_true", default=False,
-                               help="Disable testing rules with Suricata")
-    
-    update_parser.add_argument("--no-merge", action="store_true", default=False,
-                               help="Do not merge the rules into a single file")
-
-    # Hidden argument, --now to bypass the timebased bypass of
-    # updating a ruleset.
-    update_parser.add_argument(
-        "--now", default=False, action="store_true", help=argparse.SUPPRESS)
-
-    update_parser.epilog = r"""other commands:
-    update-sources             Update the source index
-    list-sources               List available sources
-    enable-source              Enable a source from the index
-    disable-source             Disable an enabled source
-    remove-source              Remove an enabled or disabled source
-    list-enabled-sources       List all enabled sources
-    add-source                 Add a new source by URL
-"""
-
-    # The Python 2.7 argparse module does prefix matching which can be
-    # undesirable. Reserve some names here that would match existing
-    # options to prevent prefix matching.
-    update_parser.add_argument("--disable", default=False,
-                               help=argparse.SUPPRESS)
-    update_parser.add_argument("--enable", default=False,
-                               help=argparse.SUPPRESS)
-    update_parser.add_argument("--modify", default=False,
-                               help=argparse.SUPPRESS)
-    update_parser.add_argument("--drop", default=False, help=argparse.SUPPRESS)
-
-    commands.listsources.register(subparsers.add_parser(
-        "list-sources", parents=[global_parser]))
-    commands.listenabledsources.register(subparsers.add_parser(
-        "list-enabled-sources", parents=[global_parser]))
-    commands.addsource.register(subparsers.add_parser(
-        "add-source", parents=[global_parser]))
-    commands.updatesources.register(subparsers.add_parser(
-        "update-sources", parents=[global_parser]))
-    commands.enablesource.register(subparsers.add_parser(
-        "enable-source", parents=[global_parser]))
-    commands.disablesource.register(subparsers.add_parser(
-        "disable-source", parents=[global_parser]))
-    commands.removesource.register(subparsers.add_parser(
-        "remove-source", parents=[global_parser]))
-
-    args = parser.parse_args(rem)
-
-    # Merge global args into args.
-    for arg in vars(global_args):
-        if not hasattr(args, arg):
-            setattr(args, arg, getattr(global_args, arg))
-        elif hasattr(args, arg) and getattr(args, arg) is None:
-            setattr(args, arg, getattr(global_args, arg))
+    args = parsers.parse_arg()
 
     # Go verbose or quiet sooner than later.
     if args.verbose:
@@ -1209,15 +905,14 @@ def _main():
     # use that, otherwise attempt to get it from Suricata.
     if args.suricata_version:
         # The Suricata version was passed on the command line, parse it.
-        suricata_version = suricata.update.engine.parse_version(
-            args.suricata_version)
+        suricata_version = engine.parse_version(args.suricata_version)
         if not suricata_version:
             logger.error("Failed to parse provided Suricata version: %s" % (
                 args.suricata_version))
             return 1
         logger.info("Forcing Suricata version to %s." % (suricata_version.full))
     elif suricata_path:
-        suricata_version = suricata.update.engine.get_version(suricata_path)
+        suricata_version = engine.get_version(suricata_path)
         if suricata_version:
             logger.info("Found Suricata version %s at %s." % (
                 str(suricata_version.full), suricata_path))
@@ -1227,15 +922,16 @@ def _main():
     else:
         logger.info(
             "Using default Suricata version of %s", DEFAULT_SURICATA_VERSION)
-        suricata_version = suricata.update.engine.parse_version(
-            DEFAULT_SURICATA_VERSION)
+        suricata_version = engine.parse_version(DEFAULT_SURICATA_VERSION)
 
     # Provide the Suricata version to the net module to add to the
     # User-Agent.
-    suricata.update.net.set_user_agent_suricata_version(suricata_version.full)
+    net.set_user_agent_suricata_version(suricata_version.full)
 
     if args.subcommand:
-        if hasattr(args, "func"):
+        if args.subcommand == "check-versions" and hasattr(args, "func"):
+            return args.func(suricata_version)
+        elif hasattr(args, "func"):
             return args.func()
         elif args.subcommand != "update":
             logger.error("Unknown command: %s", args.subcommand)
@@ -1286,18 +982,29 @@ def _main():
        os.path.exists(config.get("suricata-conf")) and \
        suricata_path and os.path.exists(suricata_path):
         logger.info("Loading %s",config.get("suricata-conf"))
-        suriconf = suricata.update.engine.Configuration.load(
-            config.get("suricata-conf"), suricata_path=suricata_path)
+        try:
+            suriconf = engine.Configuration.load(
+                config.get("suricata-conf"), suricata_path=suricata_path)
+        except subprocess.CalledProcessError:
+            return 1
 
     # Disable rule that are for app-layers that are not enabled.
     if suriconf:
         for key in suriconf.keys():
-            if key.startswith("app-layer.protocols") and \
-               key.endswith(".enabled"):
+            m = re.match("app-layer\.protocols\.([^\.]+)\.enabled", key)
+            if m:
+                proto = m.group(1)
                 if not suriconf.is_true(key, ["detection-only"]):
-                    proto = key.split(".")[2]
-                    logger.info("Disabling rules with proto %s", proto)
-                    disable_matchers.append(ProtoRuleMatcher(proto))
+                    logger.info("Disabling rules for protocol %s", proto)
+                    disable_matchers.append(matchers_mod.ProtoRuleMatcher(proto))
+                elif proto == "smb" and suriconf.build_info:
+                    # Special case for SMB rules. For versions less
+                    # than 5, disable smb rules if Rust is not
+                    # available.
+                    if suriconf.build_info["version"].major < 5:
+                        if not "RUST" in suriconf.build_info["features"]:
+                            logger.info("Disabling rules for protocol {}".format(proto))
+                            disable_matchers.append(matchers_mod.ProtoRuleMatcher(proto))
 
     # Check that the cache directory exists and is writable.
     if not os.path.exists(config.get_cache_dir()):
@@ -1320,12 +1027,11 @@ def _main():
             del(files[filename])
 
     rules = []
-    for filename in files:
+    for filename in sorted(files):
         if not filename.endswith(".rules"):
             continue
         logger.debug("Parsing %s." % (filename))
-        rules += suricata.update.rule.parse_fileobj(
-            io.BytesIO(files[filename]), filename)
+        rules += rule_mod.parse_fileobj(io.BytesIO(files[filename]), filename)
 
     rulemap = build_rule_map(rules)
     logger.info("Loaded %d rules." % (len(rules)))
@@ -1353,19 +1059,23 @@ def _main():
                 rule.enabled = True
                 enable_count += 1
 
-        for filter in drop_filters:
-            if filter.match(rule):
-                rulemap[rule.id] = filter.filter(rule)
+        for fltr in drop_filters:
+            if fltr.match(rule):
+                rulemap[rule.id] = fltr.run(rule)
                 drop_count += 1
 
-    # Apply modify filters.
-    for fltr in modify_filters:
-        for key, rule in rulemap.items():
+        for fltr in modify_filters:
             if fltr.match(rule):
-                new_rule = fltr.filter(rule)
-                if new_rule and new_rule.format() != rule.format():
+                new_rule = fltr.run(rule)
+                if new_rule:
                     rulemap[rule.id] = new_rule
                     modify_count += 1
+
+    # Check if we should disable ja3 rules.
+    try:
+        disable_ja3(suriconf, rulemap, disabled_rules)
+    except Exception as err:
+        logger.error("Failed to dynamically disable ja3 rules: %s" % (err))
 
     # Check rule vars, disabling rules that use unknown vars.
     check_vars(suriconf, rulemap)
@@ -1453,7 +1163,12 @@ def _main():
 
     return 0
 
+def signal_handler(signal, frame):
+    print('Program interrupted. Aborting...')
+    sys.exit(1)
+
 def main():
+    signal.signal(signal.SIGINT, signal_handler)
     try:
         sys.exit(_main())
     except exceptions.ApplicationError as err:

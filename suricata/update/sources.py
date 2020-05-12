@@ -16,6 +16,7 @@
 
 from __future__ import print_function
 
+import sys
 import os
 import logging
 import io
@@ -77,11 +78,13 @@ def save_source_config(source_config):
 
 class SourceConfiguration:
 
-    def __init__(self, name, header=None, url=None, params={}):
+    def __init__(self, name, header=None, url=None,
+                 params={}, checksum=True):
         self.name = name
         self.url = url
         self.params = params
         self.header = header
+        self.checksum = checksum
 
     def dict(self):
         d = {
@@ -93,6 +96,8 @@ class SourceConfiguration:
             d["params"] = self.params
         if self.header:
             d["http-header"] = self.header
+        if self.checksum:
+            d["checksum"] = self.checksum
         return d
 
 class Index:
@@ -125,6 +130,13 @@ class Index:
         if name in self.index["sources"]:
             return self.index["sources"][name]
         return None
+
+    def get_versions(self):
+        try:
+            return self.index["versions"]
+        except KeyError:
+            logger.error("Version information not in index. Please update with suricata-update update-sources.")
+            sys.exit(1)
 
 def load_source_index(config):
     return Index(get_index_filename())

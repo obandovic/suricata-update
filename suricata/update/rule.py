@@ -1,4 +1,4 @@
-# Copyright (C) 2017 Open Information Security Foundation
+# Copyright (C) 2017-2019 Open Information Security Foundation
 # Copyright (c) 2011 Jason Ish
 #
 # You can copy, redistribute or modify this Program under the terms of
@@ -76,6 +76,7 @@ class Rule(dict):
     - **classtype**: The classification type
     - **priority**: The rule priority, 0 if not provided
     - **noalert**: Is the rule a noalert rule
+    - **features**: Features required by this rule
     - **raw**: The raw rule as read from the file or buffer
 
     :param enabled: Optional parameter to set the enabled state of the rule
@@ -105,6 +106,8 @@ class Rule(dict):
         self["classtype"] = None
         self["priority"] = 0
         self["noalert"] = False
+
+        self["features"] = []
 
         self["raw"] = None
 
@@ -146,6 +149,8 @@ class Rule(dict):
         return self.format()
 
     def format(self):
+        if self.noalert and not "noalert;" in self.raw:
+            self.raw = re.sub(r'( *sid\: *[0-9]+\;)', r' noalert;\1', self.raw)
         return u"%s%s" % (u"" if self.enabled else u"# ", self.raw)
 
 def find_opt_end(options):
@@ -158,6 +163,9 @@ def find_opt_end(options):
             offset += 2
         else:
             return offset + i
+
+class BadSidError(Exception):
+    """Raises exception when sid is of type null"""
 
 def parse(buf, group=None):
     """ Parse a single rule for a string buffer.
@@ -270,6 +278,8 @@ def parse(buf, group=None):
             rule.flowbits.append(val)
             if val and val.find("noalert") > -1:
                 rule["noalert"] = True
+        elif name == "noalert":
+            rule["noalert"] = True
         elif name == "reference":
             rule.references.append(val)
         elif name == "msg":
@@ -279,8 +289,14 @@ def parse(buf, group=None):
         else:
             rule[name] = val
 
+        if name.startswith("ja3"):
+            rule["features"].append("ja3")
+
     if rule["msg"] is None:
         rule["msg"] = ""
+
+    if not rule["sid"]:
+        raise BadSidError("Sid cannot be of type null")
 
     rule["raw"] = m.group("raw").strip()
 

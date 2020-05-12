@@ -35,7 +35,9 @@ SuricataVersion = namedtuple(
     "SuricataVersion", ["major", "minor", "patch", "full", "short", "raw"])
 
 def get_build_info(suricata):
-    build_info = {}
+    build_info = {
+        "features": [],
+    }
     build_info_output = subprocess.check_output([suricata, "--build-info"])
     for line in build_info_output.decode("utf-8").split("\n"):
         line = line.strip()
@@ -45,6 +47,12 @@ def get_build_info(suricata):
             build_info["sysconfdir"] = line.split()[-1].strip()
         elif line.startswith("--localstatedir"):
             build_info["localstatedir"] = line.split()[-1].strip()
+        elif line.startswith("--datarootdir"):
+            build_info["datarootdir"] = line.split()[-1].strip()
+        elif line.startswith("Features:"):
+            build_info["features"] = line.split()[1:]
+        elif line.startswith("This is Suricata version"):
+            build_info["version"] = parse_version(line)
 
     if not "prefix" in build_info:
         logger.warning("--prefix not found in build-info.")
@@ -58,14 +66,18 @@ def get_build_info(suricata):
 class Configuration:
     """An abstraction over the Suricata configuration file."""
 
-    def __init__(self, conf):
+    def __init__(self, conf, build_info = {}):
         self.conf = conf
+        self.build_info = build_info
 
     def keys(self):
         return self.conf.keys()
 
     def has_key(self, key):
         return key in self.conf
+
+    def get(self, key):
+        return self.conf.get(key, None)
 
     def is_true(self, key, truthy=[]):
         if not key in self.conf:
@@ -80,11 +92,8 @@ class Configuration:
 
     @classmethod
     def load(cls, config_filename, suricata_path=None):
-        env = {
-            "SC_LOG_FORMAT": "%t - <%d> -- ",
-            "SC_LOG_LEVEL": "Error",
-            "ASAN_OPTIONS": "detect_leaks=0",
-        }
+        env = build_env()
+        env["SC_LOG_LEVEL"] = "Error"
         if not suricata_path:
             suricata_path = get_path()
         if not suricata_path:
@@ -101,7 +110,8 @@ class Configuration:
                 conf[key] = val
             except:
                 logger.warning("Failed to parse: %s", line)
-        return cls(conf)
+        build_info = get_build_info(suricata_path)
+        return cls(conf, build_info)
 
 def get_path(program="suricata"):
     """Find Suricata in the shell path."""
@@ -163,16 +173,18 @@ def test_configuration(suricata_path, suricata_conf=None, rule_filename=None):
     if rule_filename:
         test_command += ["-S", rule_filename]
 
-    # This makes the Suricata output look just like suricata-update
-    # output.
-    env = {
-        "SC_LOG_FORMAT": "%t - <%d> -- ",
-        "SC_LOG_LEVEL": "Warning",
-        "ASAN_OPTIONS": "detect_leaks=0",
-    }
+    env = build_env()
+    env["SC_LOG_LEVEL"] = "Warning"
 
     logger.debug("Running %s; env=%s", " ".join(test_command), str(env))
     rc = subprocess.Popen(test_command, env=env).wait()
     if rc == 0:
         return True
     return False
+
+def build_env():
+    env = os.environ.copy()
+    env["SC_LOG_FORMAT"] = "%t - <%d> -- "
+    env["SC_LOG_LEVEL"] = "Error"
+    env["ASAN_OPTIONS"] = "detect_leaks=0"
+    return env

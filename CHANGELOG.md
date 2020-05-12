@@ -1,8 +1,68 @@
 # Change Log
 
 ## unreleased
+
+### Added
+- Add summary for update-sources command:
+  https://redmine.openinfosecfoundation.org/issues/2472
+- Disable SMB rules if installed Suricata does not support them:
+  https://redmine.openinfosecfoundation.org/issues/3280
+- Better error on bad modify filter:
+  https://redmine.openinfosecfoundation.org/issues/3536
+- Missing documentation for list-sources, list-enabled-sources and
+  check-versions:
+  https://redmine.openinfosecfoundation.org/issues/3228
+- Optimization for modify filters:
+  https://redmine.openinfosecfoundation.org/issues/3620
+
+## 1.1.0 - 2019-10-11
+- Disable ja3 rules if the Suricata build or runtime configuration
+  does not support
+  ja3. https://redmine.openinfosecfoundation.org/issues/3215
+- New command, check-versions to compare the version of Suricata on
+  the system to Suricata version information in the index. Can let you
+  know if Suricata is
+  outdated. https://redmine.openinfosecfoundation.org/issues/2341
+
+## 1.1.0rc1 - 2019-09-09
 - Enable integration tests on
   Travis-CI. https://redmine.openinfosecfoundation.org/issues/2760
+- Fix error on missing sid, or missing ';' in rule
+  parsing. https://redmine.openinfosecfoundation.org/issues/2867
+- Improve permission errors from tracebacks to more user friendly
+  error messages. https://redmine.openinfosecfoundation.org/issues/2875
+- Log warnings and errors to stderr, info and debug to stdout.
+  https://redmine.openinfosecfoundation.org/issues/2565
+- Cleaner exit on CTRL-C.
+  https://redmine.openinfosecfoundation.org/issues/2878
+- Run offline.
+  https://redmine.openinfosecfoundation.org/issues/2864
+- Log warning on duplicate SID.
+  https://redmine.openinfosecfoundation.org/issues/2879
+- Parse rule files alphabetically.
+  https://redmine.openinfosecfoundation.org/issues/2892
+- Set the noalert option on rules enabled for flowbit dependencies.
+  https://redmine.openinfosecfoundation.org/issues/2906
+- Allow sources to be specified without a checksum URL to prevent the
+  warning log message when this URL does not
+  exist. https://redmine.openinfosecfoundation.org/issues/3100
+
+## 1.0.5 - 2019-04-26
+- Fix NULL pointer dereference (FORWARD_NULL) found by
+  Coverity. https://redmine.openinfosecfoundation.org/issues/2834
+- Add a download connection timeout of 30
+  seconds. https://redmine.openinfosecfoundation.org/issues/2703
+- Fix issue with --no-merge command line
+  option. https://redmine.openinfosecfoundation.org/issues/2869
+- Fix handling of default ignore
+  files. https://redmine.openinfosecfoundation.org/issues/2851
+- Allow repeated calls to enable the same rule source without exiting
+  with an error. https://redmine.openinfosecfoundation.org/issues/2728
+
+## 1.0.4 - 2019-03-07
+- Enable integration tests on
+  Travis-CI. https://redmine.openinfosecfoundation.org/issues/2760
+- Reduce memory usage. https://redmine.openinfosecfoundation.org/issues/2791
 
 ## 1.0.3 - 2018-12-21
 - Fix enable-source command.
